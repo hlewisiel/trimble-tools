@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>View snapshots</title>
+<!-- Trimble Connect Workspace API (exposes global TrimbleConnectWorkspace) -->
+<script src="https://components.connect.trimble.com/trimble-connect-workspace-api/index.js"></script>
+<!-- JSZip for bundling the images into one download -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root { --ink:#1d2433; --muted:#5b6578; --line:#d6dbe4; --blue:#0063a3; --bg:#f7f8fa; --ok:#1e7d4f; --err:#b3261e; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:14px; font:14px/1.45 "Segoe UI", system-ui, sans-serif; color:var(--ink); background:var(--bg); }
+  h1 { font-size:16px; margin:0 0 4px; }
+  p.hint { margin:0 0 12px; color:var(--muted); font-size:13px; }
+  label { display:block; font-size:13px; margin:8px 0 4px; color:var(--muted); }
+  input[type=number] { width:90px; padding:5px 6px; border:1px solid var(--line); border-radius:4px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+  button { padding:7px 12px; border:1px solid var(--blue); border-radius:4px; background:var(--blue); color:#fff; font:inherit; cursor:pointer; }
+  button.secondary { background:#fff; color:var(--blue); }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, input:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+  #views { list-style:none; margin:0; padding:0; border:1px solid var(--line); border-radius:4px; background:#fff; max-height:220px; overflow:auto; }
+  #views li { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line); }
+  #views li:last-child { border-bottom:0; }
+  #views .state { margin-left:auto; font-size:12px; color:var(--muted); }
+  #views .state.done { color:var(--ok); } #views .state.fail { color:var(--err); }
+  #status { font-size:13px; color:var(--muted); min-height:1.4em; }
+  #gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; margin-top:12px; }
+  #gallery figure { margin:0; background:#fff; border:1px solid var(--line); border-radius:4px; overflow:hidden; }
+  #gallery img { display:block; width:100%; }
+  #gallery figcaption { font-size:11px; padding:4px 6px; word-break:break-word; }
+</style>
+</head>
+<body>
+  <h1>View snapshots</h1>
+  <p class="hint">Applies each saved view in turn and captures what the 3D viewer shows.</p>
+
+  <div class="row">
+    <button id="refresh" class="secondary">Load views</button>
+    <button id="selectAll" class="secondary">Select all</button>
+  </div>
+  <ul id="views"><li>Loading views…</li></ul>
+
+  <label for="delay">Wait after applying each view (ms)</label>
+  <input id="delay" type="number" min="0" step="250" value="2500">
+
+  <div class="row">
+    <button id="run" disabled>Capture snapshots</button>
+    <button id="download" class="secondary" disabled>Download ZIP</button>
+  </div>
+  <div id="status" role="status"></div>
+  <div id="gallery"></div>
+
+<script>
+(async () => {
+  const $ = id => document.getElementById(id);
+  const listEl = $("views"), statusEl = $("status"), gallery = $("gallery");
+  let api, views = [], shots = [];
+
+  const setStatus = msg => statusEl.textContent = msg;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const safeName = s => (s || "view").replace(/[\\/:*?"<>|]+/g, "_").trim().slice(0, 120);
+
+  // 1. Connect to the Trimble Connect host (this page runs inside it as an extension)
+  try {
+    api = await TrimbleConnectWorkspace.connect(window.parent, (event, data) => {
+      // Host events arrive here; not needed for this tool
+    }, 30000);
+  } catch (e) {
+    setStatus("Could not connect to Trimble Connect. Open this page as an extension inside the 3D viewer.");
+    listEl.innerHTML = "";
+    return;
+  }
+
+  // 2. Load the project's saved views
+  async function loadViews() {
+    setStatus("Loading views…");
+    try {
+      views = await api.view.getViews();
+    } catch (e) {
+      setStatus("Failed to load views: " + e); return;
+    }
+    listEl.innerHTML = "";
+    if (!views.length) {
+      listEl.innerHTML = "<li>This project has no saved views. Create some in the Views panel, then load again.</li>";
+      $("run").disabled = true; setStatus(""); return;
+    }
+    views.forEach((v, i) => {
+      const li = document.createElement("li");
+      li.innerHTML = `<input type="checkbox" id="v${i}" checked>
+        <label for="v${i}" style="margin:0;color:inherit"></label>
+        <span class="state" id="s${i}"></span>`;
+      li.querySelector("label").textContent = v.name || v.id;
+      listEl.appendChild(li);
+    });
+    $("run").disabled = false;
+    setStatus(`${views.length} view(s) found.`);
+  }
+
+  // 3. Iterate: apply view -> wait for render -> grab snapshot
+  async function captureAll() {
+    $("run").disabled = $("download").disabled = $("refresh").disabled = true;
+    shots = []; gallery.innerHTML = "";
+    const delay = Math.max(0, Number($("delay").value) || 0);
+    const chosen = views.map((v, i) => ({ v, i })).filter(({ i }) => $("v" + i).checked);
+
+    for (let n = 0; n < chosen.length; n++) {
+      const { v, i } = chosen[n];
+      const stateEl = $("s" + i);
+      stateEl.className = "state"; stateEl.textContent = "capturing…";
+      setStatus(`Capturing ${n + 1} of ${chosen.length}: ${v.name}`);
+      try {
+        await api.view.selectView(v.id);
+        await sleep(delay);                       // let models load / camera settle
+        const dataUrl = await api.viewer.getSnapshot(); // PNG data URL
+        const file = `${String(n + 1).padStart(3, "0")}_${safeName(v.name)}.png`;
+        shots.push({ file, dataUrl });
+        gallery.insertAdjacentHTML("beforeend",
+          `<figure><img alt=""><figcaption></figcaption></figure>`);
+        const fig = gallery.lastElementChild;
+        fig.querySelector("img").src = dataUrl;
+        fig.querySelector("img").alt = v.name;
+        fig.querySelector("figcaption").textContent = file;
+        stateEl.className = "state done"; stateEl.textContent = "done";
+      } catch (e) {
+        console.error(v, e);
+        stateEl.className = "state fail"; stateEl.textContent = "failed";
+      }
+    }
+    setStatus(`Captured ${shots.length} of ${chosen.length} view(s).`);
+    $("run").disabled = $("refresh").disabled = false;
+    $("download").disabled = !shots.length;
+  }
+
+  // 4. Bundle into a ZIP
+  async function downloadZip() {
+    const zip = new JSZip();
+    shots.forEach(s => zip.file(s.file, s.dataUrl.split(",")[1], { base64: true }));
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `trimble-view-snapshots-${new Date().toISOString().slice(0,10)}.zip`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+
+  $("refresh").onclick = loadViews;
+  $("run").onclick = captureAll;
+  $("download").onclick = downloadZip;
+  $("selectAll").onclick = () => {
+    const boxes = [...listEl.querySelectorAll("input[type=checkbox]")];
+    const allOn = boxes.every(b => b.checked);
+    boxes.forEach(b => b.checked = !allOn);
+  };
+
+  loadViews();
+})();
+</script>
+</body>
+</html>

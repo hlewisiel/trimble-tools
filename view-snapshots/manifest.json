@@ -1,0 +1,7 @@
+{
+  "title": "View snapshots",
+  "description": "Iterates through saved views and captures a screenshot of each.",
+  "url": "https://YOUR-HOST/view-snapshots/index.html",
+  "icon": "https://YOUR-HOST/view-snapshots/icon.png",
+  "enabled": true
+}
